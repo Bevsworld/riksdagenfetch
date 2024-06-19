@@ -88,5 +88,5 @@ def check_and_insert_data():
 while True:
     print("Checking for new content...")
     check_and_insert_data()
-    print("Waiting for an hour...")
+    print("Waiting for an hour....")
     time.sleep(3600)  # Pause the script for an hour
