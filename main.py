@@ -228,6 +228,13 @@ def update_db_entry(link):
         session.close()
 
 
+def calculate_clip_times(speakerlist, duration):
+    timestamps = list(speakerlist.keys())
+    start_times = [sum(x * int(t) for x, t in zip([60, 1], ts.split(":"))) for ts in timestamps]
+    end_times = start_times[1:] + [duration]
+    return list(zip(start_times, end_times))
+
+
 def process_videos():
     while True:
         logging.info("Checking for entries to process...")
@@ -249,12 +256,15 @@ def process_videos():
                     download_file_with_progress(download_link, video_path)
                     logging.info(f"Downloaded video {video_id} to {video_path}")
 
-                    # Step 3: Cut the video into smaller clips
+                    # Step 3: Calculate clip times
+                    with VideoFileClip(video_path) as video:
+                        duration = int(video.duration)
+                        clip_times = calculate_clip_times(speakerlist, duration)
+
+                    # Step 4: Cut the video into smaller clips
                     with tempfile.TemporaryDirectory() as tmp_dir:
-                        for timestamp, speaker in speakerlist.items():
+                        for (start_time, end_time), (timestamp, speaker) in zip(clip_times, speakerlist.items()):
                             logging.info(f"Processing clip for {speaker} starting at {timestamp}")
-                            start_time = sum(x * int(t) for x, t in zip([60, 1], timestamp.split(":")))
-                            end_time = start_time + 30  # Assuming each clip is 30 seconds long for this example
                             clip_path = os.path.join(tmp_dir, f"{video_id}_{speaker}.mp4")
                             logging.info(f"Cutting clip for {speaker} from {start_time} to {end_time}")
 
@@ -271,7 +281,8 @@ def process_videos():
                             try:
                                 upload_path = f"{video_id}/{os.path.basename(clip_path)}"
                                 logging.info(f"Uploading clip for {speaker} to DigitalOcean Spaces: {upload_path}")
-                                client.upload_file(clip_path, DO_SPACES_BUCKET, upload_path)
+                                client.upload_file(clip_path, DO_SPACES_BUCKET, upload_path,
+                                                   ExtraArgs={'ACL': 'public-read'})
                                 logging.info(f"Uploaded clip for {speaker} to {upload_path}")
                             except Exception as e:
                                 logging.error(f"Failed to upload clip for {speaker}: {e}")
