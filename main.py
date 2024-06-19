@@ -11,11 +11,26 @@ import boto3
 import random
 import string
 import threading
-from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
+from moviepy.editor import VideoFileClip
 from tenacity import retry, wait_exponential, stop_after_attempt
+from tqdm import tqdm
+import tempfile
+import os
 
-# Configure logging
-logging.basicConfig(filename='riksdagen_scraper.log', level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
+# Configure logging to both console and file
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s %(levelname)s:%(message)s')
+
+# File handler
+file_handler = logging.FileHandler('riksdagen_scraper.log')
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 # DigitalOcean Spaces configuration
 DO_SPACES_ACCESS_KEY = 'DO009U4RBZ8UJAVE8DPL'
@@ -51,6 +66,7 @@ riksdagen_table = Table('riksdagen', metadata,
                         Column('uploadedtospaces', Boolean, default=False),  # New column for upload status
                         autoload_with=engine)
 
+
 def convert_duration_to_seconds(duration_str):
     minutes = 0
     seconds = 0
@@ -65,8 +81,10 @@ def convert_duration_to_seconds(duration_str):
     total_seconds = minutes * 60 + seconds
     return total_seconds
 
+
 def generate_unique_name(length=10):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
+
 
 def create_folder_in_space(folder_name):
     try:
@@ -77,10 +95,33 @@ def create_folder_in_space(folder_name):
         logging.error(f"Failed to create folder in DigitalOcean Space: {folder_name}/, Error: {e}")
         raise
 
+
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
 def get_db_session():
     Session = sessionmaker(bind=engine)
     return Session()
+
+
+def download_file_with_progress(url, dest_path):
+    try:
+        response = requests.get(url, stream=True)
+        response.raise_for_status()  # Raise an error for bad status codes
+        total_size = int(response.headers.get('content-length', 0))
+        block_size = 1024  # 1 Kilobyte
+        t = tqdm(total=total_size, unit='iB', unit_scale=True, desc=dest_path)
+        with open(dest_path, 'wb') as file:
+            for data in response.iter_content(block_size):
+                t.update(len(data))
+                file.write(data)
+        t.close()
+        if total_size != 0 and t.n != total_size:
+            logging.error(f"Error downloading {url}, downloaded size does not match expected size.")
+        else:
+            logging.info(f"Downloaded file {dest_path}")
+    except Exception as e:
+        logging.error(f"Failed to download file from {url}: {e}")
+        raise
+
 
 def check_and_insert_data():
     session = get_db_session()
@@ -168,6 +209,7 @@ def check_and_insert_data():
 
     session.close()
 
+
 def process_videos():
     while True:
         logging.info("Checking for entries to process...")
@@ -182,36 +224,58 @@ def process_videos():
                 logging.info(f"Processing video {video_id}...")
 
                 # Step 2: Download the video
-                video_path = f"/tmp/{video_id}.mp4"
-                logging.info(f"Downloading video from {download_link}")
-                response = requests.get(download_link)
-                with open(video_path, 'wb') as f:
-                    f.write(response.content)
-                logging.info(f"Downloaded video {video_id} to {video_path}")
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
+                        video_path = tmp_file.name
+                    logging.info(f"Downloading video from {download_link}")
+                    download_file_with_progress(download_link, video_path)
+                    logging.info(f"Downloaded video {video_id} to {video_path}")
 
-                # Step 3: Cut the video into smaller clips
-                for timestamp, speaker in speakerlist.items():
-                    logging.info(f"Processing clip for {speaker} starting at {timestamp}")
-                    start_time = sum(x * int(t) for x, t in zip([60, 1], timestamp.split(":")))
-                    end_time = start_time + 30  # Assuming each clip is 30 seconds long for this example
-                    clip_path = f"/tmp/{video_id}_{speaker}.mp4"
-                    logging.info(f"Cutting clip for {speaker} from {start_time} to {end_time}")
-                    ffmpeg_extract_subclip(video_path, start_time, end_time, targetname=clip_path)
-                    logging.info(f"Cut clip for {speaker} to {clip_path}")
+                    # Step 3: Cut the video into smaller clips
+                    with tempfile.TemporaryDirectory() as tmp_dir:
+                        for timestamp, speaker in speakerlist.items():
+                            logging.info(f"Processing clip for {speaker} starting at {timestamp}")
+                            start_time = sum(x * int(t) for x, t in zip([60, 1], timestamp.split(":")))
+                            end_time = start_time + 30  # Assuming each clip is 30 seconds long for this example
+                            clip_path = os.path.join(tmp_dir, f"{video_id}_{speaker}.mp4")
+                            logging.info(f"Cutting clip for {speaker} from {start_time} to {end_time}")
 
-                    # Step 5: Store each video file inside the DigitalOcean Spaces storage
+                            try:
+                                with VideoFileClip(video_path) as video:
+                                    new_clip = video.subclip(start_time, end_time)
+                                    new_clip.write_videofile(clip_path, codec="libx264", audio_codec="aac")
+                                logging.info(f"Cut clip for {speaker} to {clip_path}")
+                            except Exception as e:
+                                logging.error(f"Failed to cut clip for {speaker}: {e}")
+                                continue
+
+                            # Step 5: Store each video file inside the DigitalOcean Spaces storage
+                            try:
+                                upload_path = f"{video_id}/{os.path.basename(clip_path)}"
+                                logging.info(f"Uploading clip for {speaker} to DigitalOcean Spaces: {upload_path}")
+                                client.upload_file(clip_path, DO_SPACES_BUCKET, upload_path)
+                                logging.info(f"Uploaded clip for {speaker} to {upload_path}")
+                            except Exception as e:
+                                logging.error(f"Failed to upload clip for {speaker}: {e}")
+
+                    # Step 6: Update the database entry
                     try:
-                        logging.info(f"Uploading clip for {speaker} to DigitalOcean Spaces: {video_id}/{speaker}.mp4")
-                        client.upload_file(clip_path, DO_SPACES_BUCKET, f"{video_id}/{speaker}.mp4")
-                        logging.info(f"Uploaded clip for {speaker} to {video_id}/{speaker}.mp4")
+                        session.query(riksdagen_table).filter_by(link=entry.link).update({
+                            'edited': True,
+                            'uploadedtospaces': True
+                        })
+                        session.commit()
+                        logging.info(f"Updated database entry for {video_id}")
                     except Exception as e:
-                        logging.error(f"Failed to upload clip for {speaker}: {e}")
+                        logging.error(f"Failed to update database entry for {video_id}: {e}")
+                        session.rollback()
 
-                # Step 6: Update the database entry
-                entry.edited = True
-                entry.uploadedtospaces = True
-                session.commit()
-                logging.info(f"Updated database entry for {video_id}")
+                except Exception as e:
+                    logging.error(f"An error occurred during video processing: {e}")
+                finally:
+                    if os.path.exists(video_path):
+                        os.remove(video_path)
+
         except Exception as e:
             logging.error(f"An error occurred during video processing: {e}")
         finally:
@@ -219,6 +283,7 @@ def process_videos():
 
         logging.info("Waiting for next check...")
         time.sleep(3600)  # Wait for an hour before checking again
+
 
 def main():
     video_thread = threading.Thread(target=process_videos)
@@ -229,6 +294,7 @@ def main():
         check_and_insert_data()
         logging.info("Waiting for an hour....")
         time.sleep(3600)  # Pause the script for an hour
+
 
 if __name__ == "__main__":
     main()
