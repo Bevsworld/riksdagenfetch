@@ -210,6 +210,24 @@ def check_and_insert_data():
     session.close()
 
 
+@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
+def update_db_entry(link):
+    session = get_db_session()
+    try:
+        session.query(riksdagen_table).filter_by(link=link).update({
+            'edited': True,
+            'uploadedtospaces': True
+        })
+        session.commit()
+        logging.info(f"Updated database entry for {link}")
+    except Exception as e:
+        logging.error(f"Failed to update database entry for {link}: {e}")
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
 def process_videos():
     while True:
         logging.info("Checking for entries to process...")
@@ -259,16 +277,7 @@ def process_videos():
                                 logging.error(f"Failed to upload clip for {speaker}: {e}")
 
                     # Step 6: Update the database entry
-                    try:
-                        session.query(riksdagen_table).filter_by(link=entry.link).update({
-                            'edited': True,
-                            'uploadedtospaces': True
-                        })
-                        session.commit()
-                        logging.info(f"Updated database entry for {video_id}")
-                    except Exception as e:
-                        logging.error(f"Failed to update database entry for {video_id}: {e}")
-                        session.rollback()
+                    update_db_entry(entry.link)
 
                 except Exception as e:
                     logging.error(f"An error occurred during video processing: {e}")
