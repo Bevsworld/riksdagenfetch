@@ -68,17 +68,22 @@ riksdagen_table = Table('riksdagen', metadata,
 
 
 def convert_duration_to_seconds(duration_str):
+    hours = 0
     minutes = 0
     seconds = 0
+
+    hour_match = re.search(r'(\d+) timmar', duration_str)
     minute_match = re.search(r'(\d+) minuter', duration_str)
     second_match = re.search(r'(\d+) sekunder', duration_str)
 
+    if hour_match:
+        hours = int(hour_match.group(1))
     if minute_match:
         minutes = int(minute_match.group(1))
     if second_match:
         seconds = int(second_match.group(1))
 
-    total_seconds = minutes * 60 + seconds
+    total_seconds = hours * 3600 + minutes * 60 + seconds
     return total_seconds
 
 
@@ -151,6 +156,7 @@ def check_and_insert_data():
                 date_obj = dateparser.parse(date_string, languages=['sv'])
                 formatted_date = date_obj.strftime('%Y-%m-%d') if date_obj else None
 
+                # Use the updated function to convert the duration to seconds
                 duration_in_seconds = convert_duration_to_seconds(duration)
 
                 # Only proceed if the duration is longer than 600 seconds (10 minutes)
@@ -210,6 +216,7 @@ def check_and_insert_data():
     session.close()
 
 
+
 @retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
 def update_db_entry(link):
     session = get_db_session()
@@ -263,9 +270,17 @@ def process_videos():
 
                     # Step 4: Cut the video into smaller clips
                     with tempfile.TemporaryDirectory() as tmp_dir:
+                        speaker_count = {}
                         for (start_time, end_time), (timestamp, speaker) in zip(clip_times, speakerlist.items()):
                             logging.info(f"Processing clip for {speaker} starting at {timestamp}")
-                            clip_path = os.path.join(tmp_dir, f"{video_id}_{speaker}.mp4")
+
+                            if speaker not in speaker_count:
+                                speaker_count[speaker] = 1
+                            else:
+                                speaker_count[speaker] += 1
+
+                            clip_filename = f"{video_id}_{str(speaker_count[speaker]).zfill(2)}_{speaker}.mp4"
+                            clip_path = os.path.join(tmp_dir, clip_filename)
                             logging.info(f"Cutting clip for {speaker} from {start_time} to {end_time}")
 
                             try:
@@ -303,6 +318,7 @@ def process_videos():
 
         logging.info("Waiting for next check...")
         time.sleep(3600)  # Wait for an hour before checking again
+
 
 
 def main():
