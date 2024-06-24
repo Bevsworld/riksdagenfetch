@@ -10,12 +10,10 @@ import logging
 import boto3
 import random
 import string
-import threading
-from moviepy.editor import VideoFileClip
 from tenacity import retry, wait_exponential, stop_after_attempt
-from tqdm import tqdm
-import tempfile
-import os
+import sys
+import smtplib
+from email.mime.text import MIMEText
 
 # Configure logging to both console and file
 logger = logging.getLogger()
@@ -101,31 +99,32 @@ def create_folder_in_space(folder_name):
         raise
 
 
-@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
+@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(5))
 def get_db_session():
-    Session = sessionmaker(bind=engine)
-    return Session()
-
-
-def download_file_with_progress(url, dest_path):
     try:
-        response = requests.get(url, stream=True)
-        response.raise_for_status()  # Raise an error for bad status codes
-        total_size = int(response.headers.get('content-length', 0))
-        block_size = 1024  # 1 Kilobyte
-        t = tqdm(total=total_size, unit='iB', unit_scale=True, desc=dest_path)
-        with open(dest_path, 'wb') as file:
-            for data in response.iter_content(block_size):
-                t.update(len(data))
-                file.write(data)
-        t.close()
-        if total_size != 0 and t.n != total_size:
-            logging.error(f"Error downloading {url}, downloaded size does not match expected size.")
-        else:
-            logging.info(f"Downloaded file {dest_path}")
+        Session = sessionmaker(bind=engine)
+        return Session()
     except Exception as e:
-        logging.error(f"Failed to download file from {url}: {e}")
+        logging.error(f"Database connection failed: {e}")
         raise
+
+
+def send_email(subject, message):
+    sender = "your_email@example.com"
+    recipients = ["admin@example.com"]
+    msg = MIMEText(message)
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['To'] = ", ".join(recipients)
+
+    try:
+        server = smtplib.SMTP('smtp.example.com')
+        server.login("your_username", "your_password")
+        server.sendmail(sender, recipients, msg.as_string())
+        server.quit()
+        logging.info("Error notification sent.")
+    except Exception as e:
+        logging.error(f"Failed to send email notification: {e}")
 
 
 def check_and_insert_data():
@@ -133,204 +132,101 @@ def check_and_insert_data():
 
     try:
         response = requests.get('https://www.riksdagen.se/sv/sok/?avd=webbtv&doktyp=bet%2Cip')
-        response.raise_for_status()  # Raise an error for bad status codes
+        response.raise_for_status()
     except requests.RequestException as e:
         logging.error(f"Failed to fetch data: {e}")
         return
 
     if response.status_code == 200:
-        soup = BeautifulSoup(response.text, 'html.parser')
-        content_ul = soup.select_one('#content > ul')
-        for li in content_ul.find_all('li'):
-            a_tag = li.find('a')
-            aria_label = a_tag.get('aria-label')
-            href = a_tag['href']
-            full_link = href if href.startswith('http') else f"https://www.riksdagen.se{href}"
-            if aria_label:
-                parts = aria_label.split(',')
-                event_type = parts[0].strip()
-                title = parts[1].strip()
-                date_string = parts[2].strip()
-                duration = parts[3].strip()
+        try:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            content_ul = soup.select_one('#content > ul')
+            for li in content_ul.find_all('li'):
+                try:
+                    a_tag = li.find('a')
+                    aria_label = a_tag.get('aria-label')
+                    href = a_tag['href']
+                    full_link = href if href.startswith('http') else f"https://www.riksdagen.se{href}"
+                    if aria_label:
+                        parts = aria_label.split(',')
+                        event_type = parts[0].strip()
+                        title = parts[1].strip()
+                        date_string = parts[2].strip()
+                        duration = parts[3].strip()
 
-                date_obj = dateparser.parse(date_string, languages=['sv'])
-                formatted_date = date_obj.strftime('%Y-%m-%d') if date_obj else None
+                        date_obj = dateparser.parse(date_string, languages=['sv'])
+                        formatted_date = date_obj.strftime('%Y-%m-%d') if date_obj else None
 
-                # Use the updated function to convert the duration to seconds
-                duration_in_seconds = convert_duration_to_seconds(duration)
+                        duration_in_seconds = convert_duration_to_seconds(duration)
 
-                # Only proceed if the duration is longer than 600 seconds (10 minutes)
-                if duration_in_seconds > 600:
-                    exists = session.query(riksdagen_table).filter_by(link=full_link).first()
-                    if not exists:
-                        try:
-                            # Generate a unique name for the new entry
-                            unique_name = generate_unique_name()
+                        if duration_in_seconds > 600:
+                            exists = session.query(riksdagen_table).filter_by(link=full_link).first()
+                            if not exists:
+                                try:
+                                    unique_name = generate_unique_name()
+                                    create_folder_in_space(unique_name)
 
-                            # Create a new folder in the DigitalOcean Space
-                            create_folder_in_space(unique_name)
+                                    event_response = requests.get(full_link)
+                                    event_response.raise_for_status()
+                                    event_soup = BeautifulSoup(event_response.text, 'html.parser')
+                                    download_link_element = event_soup.select_one('#below-player > ul > li:nth-child(2) > a')
+                                    if download_link_element:
+                                        download_link = download_link_element['href']
+                                    else:
+                                        logging.warning(f"Download link not found for: {title}")
+                                        download_link = None
 
-                            # Visit the page and scrape additional details
-                            event_response = requests.get(full_link)
-                            event_response.raise_for_status()  # Raise an error for bad status codes
-                            event_soup = BeautifulSoup(event_response.text, 'html.parser')
-                            download_link_element = event_soup.select_one('#below-player > ul > li:nth-child(2) > a')
-                            if download_link_element:
-                                download_link = download_link_element['href']
+                                    speakers_list = event_soup.select_one('#speakers-list > ol')
+                                    speakers_data = {}
+                                    if speakers_list:
+                                        for speaker_item in speakers_list.find_all('li'):
+                                            speaker_name = speaker_item.select_one('a > span.sc-31b8789-2.fuVqcV').text
+                                            speaker_time = speaker_item.select_one('a > time').text
+                                            speakers_data[speaker_time] = speaker_name
+
+                                    new_record = riksdagen_table.insert().values(
+                                        title=title,
+                                        type=event_type,
+                                        date=formatted_date,
+                                        length=duration_in_seconds,
+                                        link=full_link,
+                                        download=download_link,
+                                        speakerlist=json.dumps(speakers_data),
+                                        spacesfolder=unique_name,
+                                        edited=False,
+                                        uploadedtospaces=False
+                                    )
+                                    session.execute(new_record)
+                                    session.commit()
+                                    logging.info(f"New record inserted: {title}")
+                                except Exception as e:
+                                    logging.error(f"An error occurred while processing {title}: {e}")
+                                    session.rollback()
                             else:
-                                logging.warning(f"Download link not found for: {title}")
-                                download_link = None
-
-                            speakers_list = event_soup.select_one('#speakers-list > ol')
-                            speakers_data = {}
-                            if speakers_list:
-                                for speaker_item in speakers_list.find_all('li'):
-                                    speaker_name = speaker_item.select_one('a > span.sc-31b8789-2.fuVqcV').text
-                                    speaker_time = speaker_item.select_one('a > time').text
-                                    speakers_data[speaker_time] = speaker_name
-
-                            new_record = riksdagen_table.insert().values(
-                                title=title,
-                                type=event_type,
-                                date=formatted_date,
-                                length=duration_in_seconds,
-                                link=full_link,
-                                download=download_link,
-                                speakerlist=json.dumps(speakers_data),
-                                spacesfolder=unique_name,  # Add the unique name to the database entry as folder name
-                                edited=False,  # Initialize edited status as False
-                                uploadedtospaces=False  # Initialize upload status as False
-                            )
-                            session.execute(new_record)
-                            session.commit()
-                            logging.info(f"New record inserted: {title}")
-                        except Exception as e:
-                            logging.error(f"An error occurred while processing {title}: {e}")
-                    else:
-                        logging.info(f"Record already exists: {title}")
-                else:
-                    logging.info(f"Skipping video shorter than 10 minutes: {title}")
+                                logging.info(f"Record already exists: {title}")
+                        else:
+                            logging.info(f"Skipping video shorter than 10 minutes: {title}")
+                except Exception as e:
+                    logging.error(f"Error processing list item: {e}")
+        except Exception as e:
+            logging.error(f"Error parsing HTML content: {e}")
     else:
         logging.error(f"Failed to fetch data: status code {response.status_code}")
 
     session.close()
 
 
-
-@retry(wait=wait_exponential(multiplier=1, min=4, max=10), stop=stop_after_attempt(3))
-def update_db_entry(link):
-    session = get_db_session()
-    try:
-        session.query(riksdagen_table).filter_by(link=link).update({
-            'edited': True,
-            'uploadedtospaces': True
-        })
-        session.commit()
-        logging.info(f"Updated database entry for {link}")
-    except Exception as e:
-        logging.error(f"Failed to update database entry for {link}: {e}")
-        session.rollback()
-        raise
-    finally:
-        session.close()
-
-
-def calculate_clip_times(speakerlist, duration):
-    timestamps = list(speakerlist.keys())
-    start_times = [sum(x * int(t) for x, t in zip([60, 1], ts.split(":"))) for ts in timestamps]
-    end_times = start_times[1:] + [duration]
-    return list(zip(start_times, end_times))
-
-
-def process_videos():
-    while True:
-        logging.info("Checking for entries to process...")
-        session = get_db_session()
-
-        try:
-            entries = session.query(riksdagen_table).filter_by(edited=False).all()
-            for entry in entries:
-                download_link = entry.download
-                video_id = entry.spacesfolder
-                speakerlist = json.loads(entry.speakerlist) if isinstance(entry.speakerlist, str) else entry.speakerlist
-                logging.info(f"Processing video {video_id}...")
-
-                # Step 2: Download the video
-                try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
-                        video_path = tmp_file.name
-                    logging.info(f"Downloading video from {download_link}")
-                    download_file_with_progress(download_link, video_path)
-                    logging.info(f"Downloaded video {video_id} to {video_path}")
-
-                    # Step 3: Calculate clip times
-                    with VideoFileClip(video_path) as video:
-                        duration = int(video.duration)
-                        clip_times = calculate_clip_times(speakerlist, duration)
-
-                    # Step 4: Cut the video into smaller clips
-                    with tempfile.TemporaryDirectory() as tmp_dir:
-                        speaker_count = {}
-                        for (start_time, end_time), (timestamp, speaker) in zip(clip_times, speakerlist.items()):
-                            logging.info(f"Processing clip for {speaker} starting at {timestamp}")
-
-                            if speaker not in speaker_count:
-                                speaker_count[speaker] = 1
-                            else:
-                                speaker_count[speaker] += 1
-
-                            clip_filename = f"{video_id}_{str(speaker_count[speaker]).zfill(2)}_{speaker}.mp4"
-                            clip_path = os.path.join(tmp_dir, clip_filename)
-                            logging.info(f"Cutting clip for {speaker} from {start_time} to {end_time}")
-
-                            try:
-                                with VideoFileClip(video_path) as video:
-                                    new_clip = video.subclip(start_time, end_time)
-                                    new_clip.write_videofile(clip_path, codec="libx264", audio_codec="aac")
-                                logging.info(f"Cut clip for {speaker} to {clip_path}")
-                            except Exception as e:
-                                logging.error(f"Failed to cut clip for {speaker}: {e}")
-                                continue
-
-                            # Step 5: Store each video file inside the DigitalOcean Spaces storage
-                            try:
-                                upload_path = f"{video_id}/{os.path.basename(clip_path)}"
-                                logging.info(f"Uploading clip for {speaker} to DigitalOcean Spaces: {upload_path}")
-                                client.upload_file(clip_path, DO_SPACES_BUCKET, upload_path,
-                                                   ExtraArgs={'ACL': 'public-read'})
-                                logging.info(f"Uploaded clip for {speaker} to {upload_path}")
-                            except Exception as e:
-                                logging.error(f"Failed to upload clip for {speaker}: {e}")
-
-                    # Step 6: Update the database entry
-                    update_db_entry(entry.link)
-
-                except Exception as e:
-                    logging.error(f"An error occurred during video processing: {e}")
-                finally:
-                    if os.path.exists(video_path):
-                        os.remove(video_path)
-
-        except Exception as e:
-            logging.error(f"An error occurred during video processing: {e}")
-        finally:
-            session.close()
-
-        logging.info("Waiting for next check...")
-        time.sleep(3600)  # Wait for an hour before checking again
-
-
-
 def main():
-    video_thread = threading.Thread(target=process_videos)
-    video_thread.start()
-
-    while True:
-        logging.info("Checking for new content...")
-        check_and_insert_data()
-        logging.info("Waiting for an hour....")
-        time.sleep(3600)  # Pause the script for an hour
-
+    try:
+        while True:
+            logging.info("Checking for new content...")
+            check_and_insert_data()
+            logging.info("Waiting for an hour....")
+            time.sleep(3600)  # Pause the script for an hour
+    except Exception as e:
+        logging.critical(f"Unexpected error: {e}")
+        send_email("Riksdagen Scraper Critical Error", f"Unexpected error occurred: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
